@@ -1,0 +1,20 @@
+{
+  "port": 8765,
+  "params_file": "params.scad",
+  "targets": [
+    {"name": "tray",   "file": "parts/tray.scad"},
+    {"name": "lid",    "file": "parts/lid.scad"},
+    {"name": "coupon", "file": "parts/tray.scad", "defines": ["part_h=15"]},
+    {"name": "gauge",  "file": "parts/gauge.scad"}
+  ],
+  "params": [
+    {"name": "lid_clear", "min": 0.1, "max": 1.0, "step": 0.05,
+     "tag": "UNVERIFIED", "note": "lid vs tray, per side; the gauge decides"},
+    {"name": "wall",      "min": 0.8, "max": 3.2, "step": 0.4, "note": "whole perimeters of a 0.4 nozzle"},
+    {"name": "inner_w",   "min": 20,  "max": 200, "step": 5,   "tag": "PLACEHOLDER"},
+    {"name": "inner_d",   "min": 20,  "max": 200, "step": 5,   "tag": "PLACEHOLDER"},
+    {"name": "inner_h",   "min": 10,  "max": 150, "step": 5,   "tag": "PLACEHOLDER"},
+    {"name": "corner_r",  "min": 2,   "max": 12,  "step": 0.5}
+  ],
+  "probe": ["outer_w", "outer_d", "outer_h", "lid_outer_w", "lid_outer_d", "lid_outer_h"]
+}

@@ -1,0 +1,259 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>scadview</title>
+<style>
+ html,body{margin:0;height:100%;background:#15171a;color:#d7dbe0;font:13px/1.4 ui-monospace,monospace}
+ body{display:grid;grid-template-columns:230px 1fr;grid-template-rows:1fr auto;overflow:hidden}
+ #rail{grid-column:1;grid-row:1/3;overflow:auto;padding:8px;background:#1b1e22;border-right:1px solid #2b3037}
+ #view{grid-column:2;grid-row:1;position:relative;min-width:0}
+ #bar{grid-column:2;grid-row:2;max-height:34%;overflow:auto;padding:6px 10px;background:#181b1fdd;border-top:1px solid #2b3037;white-space:pre-wrap}
+ button{display:block;width:100%;text-align:left;margin:2px 0;padding:5px 7px;background:#22262b;color:#cfd4da;border:1px solid #2f353c;border-radius:4px;font:inherit;cursor:pointer}
+ button.sel{background:#2f6f4f;color:#fff;border-color:#3d8a63}
+ button:disabled{opacity:.4;cursor:default}
+ .err{color:#ff8b7a}.ok{color:#8fd8a8}
+ h2{font:600 11px/1.4 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.04em;color:#7d8590;margin:14px 0 6px;border-top:1px solid #2b3037;padding-top:10px}
+ h2:first-of-type{border-top:0;margin-top:0;padding-top:0}
+ .prow{margin:8px 0}
+ .plabel{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
+ .pname{color:#cfd4da}
+ .pval{color:#e8b060;font-variant-numeric:tabular-nums}
+ .chip{font-size:9px;padding:1px 5px;border-radius:3px;letter-spacing:.03em;margin-left:6px}
+ .chip.UNVERIFIED{background:#4a2f1a;color:#ffb066}
+ .chip.PLACEHOLDER{background:#2a2a4a;color:#a6a6ff}
+ .pnote{color:#5c636c;font-size:11px;margin-top:1px}
+ input[type=range]{width:100%;accent-color:#3d8a63}
+ #numbers{position:absolute;top:8px;right:8px;max-width:280px;max-height:calc(100% - 16px);overflow:auto;
+   background:#181b1fcc;border:1px solid #2b3037;border-radius:6px;padding:8px 10px;font-size:11px;
+   backdrop-filter:blur(2px)}
+ #numbers h3{margin:0 0 6px;font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:#7d8590}
+ #numbers .row{display:flex;justify-content:space-between;gap:10px;white-space:nowrap}
+ #numbers .k{color:#7d8590}
+ #numbers .delta{color:#e8b060}
+ #numbers .delta.zero{color:#4c525a}
+ #slowgate{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+   background:#15171acc}
+ #slowgate button{width:auto;padding:12px 20px;font-size:14px;background:#2f6f4f;color:#fff;
+   border-color:#3d8a63}
+ @media(max-width:700px){
+  body{grid-template-columns:1fr;grid-template-rows:40vh 1fr auto}
+  #rail{grid-column:1;grid-row:1}
+  #view{grid-column:1;grid-row:2}
+  #bar{grid-column:1;grid-row:3}
+  #numbers{max-width:60vw;font-size:10px}
+ }
+</style></head><body>
+<div id="rail">
+ <h2>Parts</h2>
+ <div id="ui"></div>
+ <h2>Parameters</h2>
+ <div id="params"></div>
+</div>
+<div id="view">
+  <div id="numbers"></div>
+  <div id="slowgate"><button id="slowbtn"></button></div>
+</div>
+<div id="bar">starting…</div>
+<script type="importmap">{"imports":{"three":"/vendor/three.module.min.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from '/vendor/OrbitControls.js';
+import {STLLoader} from '/vendor/STLLoader.js';
+
+const view=document.getElementById('view'), ui=document.getElementById('ui'), bar=document.getElementById('bar');
+const paramsEl=document.getElementById('params'), numbersEl=document.getElementById('numbers');
+const slowgate=document.getElementById('slowgate'), slowbtn=document.getElementById('slowbtn');
+
+// Targets flagged "slow" in scadview.json are never auto-rendered on a
+// slider drag or a file-change event; they get a render button instead.
+let SLOW = {};
+
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x15171a);
+const cam=new THREE.PerspectiveCamera(45,1,0.5,20000); cam.up.set(0,0,1); cam.position.set(220,-260,180);
+const rend=new THREE.WebGLRenderer({antialias:true}); view.insertBefore(rend.domElement, numbersEl);
+const ctl=new OrbitControls(cam,rend.domElement); ctl.enableDamping=true;
+scene.add(new THREE.HemisphereLight(0xffffff,0x33363c,2.0));
+const key=new THREE.DirectionalLight(0xffffff,1.6); key.position.set(1,-1.4,2); scene.add(key);
+const grid=new THREE.GridHelper(300,30,0x3a4048,0x24282d); grid.rotation.x=Math.PI/2; scene.add(grid);
+const mat=new THREE.MeshStandardMaterial({color:0xc8862f,metalness:0.1,roughness:0.65,flatShading:false});
+let mesh=null, cur=null, fitted=null, renderToken=0;
+function resize(){const w=view.clientWidth,h=view.clientHeight;rend.setPixelRatio(devicePixelRatio);rend.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix();}
+addEventListener('resize',resize);resize();
+new ResizeObserver(resize).observe(view);
+(function loop(){requestAnimationFrame(loop);ctl.update();rend.render(scene,cam);})();
+
+// ---- parameters: whitelisted -D sliders from scadview.json; defaults come
+// from params.scad via the server, so a slider never silently disagrees
+// with the file it's exploring ------------------------------------------
+let PARAMDEFS = await (await fetch('/api/params')).json();
+let params = {};
+for (const p of PARAMDEFS) params[p.name] = p.default;
+try {
+  const saved = JSON.parse(localStorage.scadview_params || '{}');
+  for (const k in saved) if (k in params) params[k] = saved[k];
+} catch(e) {}
+
+function paramsQuery(){
+  return PARAMDEFS.map(p=>'&p='+encodeURIComponent(p.name+'='+params[p.name])).join('');
+}
+
+let BASELINE = null; // probe() at every param default — the "as params.scad has it" values
+async function loadBaseline(){
+  const defaults = {}; for (const p of PARAMDEFS) defaults[p.name]=p.default;
+  const q = PARAMDEFS.map(p=>'&p='+encodeURIComponent(p.name+'='+p.default)).join('');
+  const r = await (await fetch('/api/probe?x=1'+q)).json();
+  BASELINE = r.ok ? r.values : null;
+}
+await loadBaseline();
+
+let probeTimer=null;
+async function updateNumbers(){
+  const r = await (await fetch('/api/probe?x=1'+paramsQuery())).json();
+  if (!r.ok){ numbersEl.innerHTML = '<h3>derived values</h3><div class="row err">'+esc(r.error)+'</div>'; return; }
+  if (!Object.keys(r.values).length){ numbersEl.style.display='none'; return; }
+  let html = '<h3>derived values</h3>';
+  for (const k in r.values){
+    const v = r.values[k], base = BASELINE ? BASELINE[k] : v, d = v-base;
+    const dcls = Math.abs(d) < 1e-6 ? 'delta zero' : 'delta';
+    const dtxt = Math.abs(d) < 1e-6 ? '' : ' <span class="'+dcls+'">'+(d>0?'+':'')+d.toFixed(3)+'</span>';
+    html += '<div class="row"><span class="k">'+k+'</span><span>'+v.toFixed(3)+dtxt+'</span></div>';
+  }
+  numbersEl.innerHTML = html;
+}
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function buildParamsUI(){
+  paramsEl.innerHTML='';
+  for (const p of PARAMDEFS){
+    const row=document.createElement('div'); row.className='prow';
+    const chip = p.tag ? '<span class="chip '+p.tag+'">'+p.tag+'</span>' : '';
+    row.innerHTML = `<div class="plabel"><span class="pname">${p.name}${chip}</span>
+        <span class="pval" id="pv-${p.name}">${params[p.name]}</span></div>
+      <input type="range" id="pi-${p.name}" min="${p.min}" max="${p.max}" step="${p.step}" value="${params[p.name]}">
+      ${p.note ? '<div class="pnote">'+esc(p.note)+'</div>' : ''}`;
+    paramsEl.appendChild(row);
+    const input = row.querySelector('input');
+    input.addEventListener('input', ()=>{
+      params[p.name] = parseFloat(input.value);
+      row.querySelector('.pval').textContent = params[p.name];
+      // Fast path while dragging: the probe answers "what did this DO" in
+      // ~10ms, far under what a real render costs. A 0.4mm clearance change
+      // on a 120mm part is invisible in 3D at any zoom that keeps the part
+      // in frame, but the numbers move exactly.
+      clearTimeout(probeTimer); probeTimer=setTimeout(updateNumbers, 120);
+    });
+    input.addEventListener('change', ()=>{
+      localStorage.scadview_params = JSON.stringify(params);
+      if (cur && !(cur in SLOW)) kickRender();
+    });
+  }
+}
+buildParamsUI();
+
+// draft render immediately on release, fine render 600ms after the LAST
+// change (so a rapid string of slider releases only pays for one fine pass)
+let fineTimer=null;
+function kickRender(){
+  renderAndShow(false,'draft');
+  clearTimeout(fineTimer);
+  fineTimer=setTimeout(()=>renderAndShow(false,'fine'), 600);
+}
+
+// ---- mesh loading / error display --------------------------------------
+const loader=new STLLoader();
+function setDimmed(dimmed){
+  mat.transparent = dimmed; mat.opacity = dimmed ? 0.35 : 1.0;
+  mat.needsUpdate = true; // three.js caches the opaque/blended render path per material;
+                           // toggling .transparent at runtime silently no-ops without this
+                           // (caught by screenshotting the error state and diffing pixels
+                           // against the ok state — they were bit-identical without this line)
+}
+function showError(text){
+  bar.className='err'; bar.textContent = text || 'render failed';
+  setDimmed(true); // last good mesh stays on screen, dimmed — never blank the canvas
+}
+
+async function renderAndShow(refit, quality){
+  if (!cur) return;
+  const token = ++renderToken;
+  bar.className=''; bar.textContent = `rendering ${cur} (${quality}) …`;
+  let r;
+  try { r = await (await fetch(`/api/render?t=${encodeURIComponent(cur)}&q=${quality}${paramsQuery()}`)).json(); }
+  catch(e){ if(token===renderToken) showError('request failed: '+e); return; }
+  if (token!==renderToken) return;
+  if (!r.ok){ showError(r.error||'render failed'); return; }
+  let resp;
+  try { resp = await fetch(`/api/stl?t=${encodeURIComponent(cur)}&q=${quality}${paramsQuery()}`); }
+  catch(e){ if(token===renderToken) showError('stl fetch failed: '+e); return; }
+  if (token!==renderToken) return;
+  if (!resp.ok){ showError(await resp.text()); return; }
+  const buf = await resp.arrayBuffer();
+  if (token!==renderToken) return;
+  const geo=loader.parse(buf); geo.computeVertexNormals(); geo.computeBoundingBox();
+  const bb=geo.boundingBox, c=bb.getCenter(new THREE.Vector3()), sz=bb.getSize(new THREE.Vector3());
+  geo.translate(-c.x,-c.y,-bb.min.z);
+  if(mesh){scene.remove(mesh);mesh.geometry.dispose();}
+  setDimmed(false);
+  mesh=new THREE.Mesh(geo,mat); scene.add(mesh);
+  const m=Math.max(sz.x,sz.y,sz.z);
+  grid.scale.setScalar(Math.max(1,m/150));
+  if(refit||fitted!==cur){const d=m*1.9;cam.position.set(d*0.7,-d*0.8,d*0.6);ctl.target.set(0,0,sz.z/2);fitted=cur;}
+  bar.className='ok';
+  bar.textContent=`${cur}  ${quality}  ${r.ms} ms  ${(buf.byteLength/1024|0)} KB  ${sz.x.toFixed(1)}x${sz.y.toFixed(1)}x${sz.z.toFixed(1)} mm\n`+r.echo.join('\n');
+}
+
+// ---- part selection -----------------------------------------------------
+async function show(name,refit){
+  cur=name; [...ui.children].forEach(b=>b.classList.toggle('sel',b.textContent.startsWith(name)));
+  const slow = name in SLOW;
+  for (const inp of paramsEl.querySelectorAll('input')) inp.disabled = slow;
+  if (slow){
+    slowgate.style.display='flex';
+    slowbtn.textContent = `render ${name} (${SLOW[name]})`;
+    slowbtn.dataset.stale = '';
+    bar.className=''; bar.textContent = `${name} — flagged slow in scadview.json, not auto-rendered. Click render.`;
+    updateNumbers();
+    return;
+  }
+  slowgate.style.display='none';
+  await renderAndShow(refit,'fine');
+  updateNumbers();
+}
+slowbtn.onclick=()=>{ slowgate.style.display='none'; renderAndShow(true,'fine'); };
+
+const targets=await (await fetch('/api/targets')).json();
+const names=targets.map(t=>t.name);
+SLOW=Object.fromEntries(targets.filter(t=>t.slow).map(t=>[t.name,t.slow]));
+
+// Deep links: /#joint_gauge opens straight onto that part, so a part can be
+// linked to in conversation the way a file path is. replaceState rather than
+// assigning location.hash — assigning would fire hashchange and re-enter
+// show() for the part we are already on.
+const hashTarget=()=>{try{return decodeURIComponent((location.hash||'').slice(1)).trim();}catch(e){return '';}};
+function openTarget(n,refit){ if(location.hash.slice(1)!==n) history.replaceState(null,'','#'+n); show(n,refit); }
+
+for(const n of names){const b=document.createElement('button');b.textContent=n;b.onclick=()=>openTarget(n,false);ui.appendChild(b);}
+
+// A hash that names a real target wins over the remembered part; a stale or
+// bogus one falls through to it rather than showing an empty canvas.
+const want=hashTarget();
+openTarget(names.includes(want)?want:(localStorage.scadview_last||names[0]),true);
+
+// pasting a different #part into the same tab switches parts
+addEventListener('hashchange',()=>{const n=hashTarget(); if(names.includes(n)&&n!==cur) show(n,false);});
+
+// ---- live reload on .scad save ------------------------------------------
+new EventSource('/api/events').addEventListener('change',()=>{
+  if (!cur) return;
+  if (cur in SLOW){
+    // never auto-render the slow parts — just flag that the on-screen
+    // model (or the render button) is now behind the saved source
+    slowgate.style.display='flex';
+    slowbtn.textContent = `re-render ${cur} (${SLOW[cur]}) — source changed`;
+    bar.className='';
+    return;
+  }
+  renderAndShow(false,'fine');
+  updateNumbers();
+});
+addEventListener('beforeunload',()=>{if(cur)localStorage.scadview_last=cur;});
+</script></body></html>

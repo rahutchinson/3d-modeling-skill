@@ -1,0 +1,6 @@
+.scadview-cache/
+__pycache__/
+template/stl/
+# raw research stays local; only the README is tracked
+inbox/*
+!inbox/README.md
