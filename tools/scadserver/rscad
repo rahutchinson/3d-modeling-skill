@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""rscad — a drop-in `openscad` command that renders on an openscad-server.
+
+    OPENSCAD=rscad make            # every Makefile / check.sh / scadview in the skill
+    rscad -o stl/x.stl parts/x.scad
+
+It finds the project root (the nearest parent with params.scad, Makefile,
+scadview.json or .git), bundles the project's source files with the argv,
+sends them to the server, and writes the outputs back where openscad would
+have. stdout/stderr/exit code are the server-side openscad's.
+
+Config (env wins over file):
+  RSCAD_URL      ~/.config/rscad/url      e.g. http://render-box.local:8790
+  RSCAD_TOKEN    ~/.config/rscad/token    shared secret from the server
+  RSCAD_ENGINE                            server engine name (default: server's default)
+  RSCAD_TIMEOUT                           job wall clock in seconds
+  RSCAD_LOCAL=1                           skip the server, run a local openscad
+  RSCAD_VERBOSE=1                         say what was bundled and how long it took
+
+Own flags (stripped before forwarding): --rscad-engine=NAME --rscad-timeout=S
+--rscad-local --rscad-verbose --rscad-status.
+
+If the server is unreachable and a local openscad (that isn't this script)
+is on PATH, it runs that instead and says so on stderr.
+"""
+import fnmatch, hashlib, io, json, os, socket, subprocess, sys, tarfile, time
+import urllib.error, urllib.request
+
+MARKERS = ("params.scad", "scadview.json", "Makefile", ".git")
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".ruff_cache"}
+OUTPUT_DIRS = {"stl", ".scadview-cache", "out", "build", "dist"}     # ship only sources from these
+OUTPUT_EXT = {".stl", ".3mf", ".obj", ".off", ".amf", ".echo", ".d", ".png", ".log", ".gcode", ".csg", ".tmp"}
+MAX_FILE = 25 * 1024 * 1024
+VALUE_OPTS_SHORT = {"-o", "-d", "-m", "-D", "-p", "-P", "-O"}
+VALUE_OPTS_LONG = {"camera", "imgsize", "projection", "colorscheme", "export-format", "backend", "enable",
+                   "animate", "animate_sharding", "summary", "summary-file", "view", "o", "d", "m", "D", "p", "P", "O",
+                   "autocenter", "trust-python"}
+OUTPUT_OPTS = {"-o", "-d", "--summary-file"}
+INPUT_OPTS = {"-p"}
+
+
+def cfg(name, fname):
+    v = os.environ.get(name)
+    if v:
+        return v.strip()
+    try:
+        with open(os.path.expanduser(f"~/.config/rscad/{fname}")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def find_root(cwd):
+    d = cwd
+    while True:
+        if any(os.path.exists(os.path.join(d, m)) for m in MARKERS):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d or d == os.path.expanduser("~"):
+            return cwd
+        d = parent
+
+
+def load_ignore(root):
+    pats = []
+    try:
+        with open(os.path.join(root, ".rscadignore")) as f:
+            pats = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        pass
+    return pats
+
+
+def bundle_files(root, verbose):
+    ignore = load_ignore(root)
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        in_output_dir = any(part in OUTPUT_DIRS for part in rel_dir.split(os.sep) if part)
+        for fn in sorted(filenames):
+            rel = os.path.join(rel_dir, fn) if rel_dir else fn
+            ext = os.path.splitext(fn)[1].lower()
+            if in_output_dir and ext in OUTPUT_EXT:
+                continue
+            if any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(fn, p) for p in ignore):
+                continue
+            full = os.path.join(dirpath, fn)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            size = os.path.getsize(full)
+            if size > MAX_FILE:
+                if verbose:
+                    sys.stderr.write(f"rscad: skipping {rel} ({size >> 20} MB > limit)\n")
+                continue
+            files.append((rel, full))
+    return files
+
+
+def parse_args(argv, cwd, root):
+    """Split argv into forwarded args (with @OUT@/@SRC@ placeholders), the output
+    map, the external input files to ship, and the rscad-only options."""
+    opts = {"engine": cfg("RSCAD_ENGINE", "engine"), "timeout": cfg("RSCAD_TIMEOUT", "timeout"),
+            "local": os.environ.get("RSCAD_LOCAL") == "1", "verbose": os.environ.get("RSCAD_VERBOSE") == "1",
+            "status": False}
+    fwd, outputs, externs = [], [], []
+    n_inputs = 0
+
+    def map_output(path):
+        idx = len(outputs)
+        outputs.append(os.path.abspath(os.path.join(cwd, path)))
+        return f"@OUT@/{idx}/{os.path.basename(path)}"
+
+    def map_input(path):
+        nonlocal n_inputs
+        n_inputs += 1
+        full = os.path.realpath(os.path.join(cwd, path))
+        if full.startswith(os.path.realpath(root) + os.sep) and os.path.exists(full):
+            return path                      # inside the project: ship as part of the tree, keep the arg as is
+        if not os.path.exists(full):
+            return path                      # let openscad report the missing file
+        idx = len(externs)
+        externs.append(full)
+        return f"@SRC@/__extern__/{idx}/{os.path.basename(path)}"
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--rscad-"):
+            k, _, v = a[8:].partition("=")
+            if k == "engine": opts["engine"] = v
+            elif k == "timeout": opts["timeout"] = v
+            elif k == "local": opts["local"] = True
+            elif k == "verbose": opts["verbose"] = True
+            elif k == "status": opts["status"] = True
+            else: sys.exit(f"rscad: unknown option {a}")
+            i += 1; continue
+        if a == "--":
+            fwd.append(a); i += 1
+            while i < len(argv):
+                fwd.append(map_input(argv[i])); i += 1
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name in VALUE_OPTS_LONG and not eq and i + 1 < len(argv):
+                val = argv[i + 1]; i += 1
+                if f"--{name}" in OUTPUT_OPTS: val = map_output(val)
+                fwd += [a, val]
+            elif eq and f"--{name}" in OUTPUT_OPTS:
+                fwd.append(f"--{name}={map_output(val)}")
+            else:
+                fwd.append(a)
+            i += 1; continue
+        if a.startswith("-") and len(a) > 1:
+            opt, joined = a[:2], a[2:]
+            if opt in VALUE_OPTS_SHORT:
+                if joined:
+                    val = joined
+                else:
+                    if i + 1 >= len(argv):
+                        fwd.append(a); i += 1; continue
+                    val = argv[i + 1]; i += 1
+                if opt in OUTPUT_OPTS: val = map_output(val)
+                elif opt in INPUT_OPTS: val = map_input(val)
+                fwd += [opt, val]
+            else:
+                fwd.append(a)
+            i += 1; continue
+        fwd.append(map_input(a)); i += 1
+    return fwd, outputs, externs, opts, n_inputs
+
+
+def local_openscad():
+    me = os.path.realpath(sys.argv[0])
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d, "openscad")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) and os.path.realpath(cand) != me:
+            return cand
+    return None
+
+
+def run_local(argv, why):
+    exe = local_openscad()
+    if not exe:
+        sys.stderr.write(f"rscad: {why}, and no local openscad on PATH\n")
+        return 2
+    sys.stderr.write(f"rscad: {why}; running local {exe}\n")
+    return subprocess.call([exe] + argv)
+
+
+def show_status(url):
+    with urllib.request.urlopen(url.rstrip("/") + "/api/status", timeout=10) as r:
+        s = json.load(r)
+    print(f"{url}  up {s['uptime_seconds']//3600}h{(s['uptime_seconds']%3600)//60:02d}m  workers={s['workers']}  "
+          f"done={s['done']} failed={s['failed']} cache_hits={s['cache_hits']}")
+    for k, v in s["engines"].items():
+        print(f"  engine {k}{' (default)' if k == s['default_engine'] else ''}: {v}")
+    for r in s["running"]:
+        print(f"  running {r['id']} {r['engine']} {r['seconds']}s  {r['args']}")
+    if s["queued"]:
+        print(f"  queued: {s['queued']}")
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    cwd = os.getcwd()
+    root = find_root(cwd)
+    fwd, outputs, externs, opts, n_inputs = parse_args(argv, cwd, root)
+    url = cfg("RSCAD_URL", "url")
+    token = cfg("RSCAD_TOKEN", "token")
+
+    if opts["status"]:
+        if not url:
+            sys.exit("rscad: no server configured (RSCAD_URL or ~/.config/rscad/url)")
+        return show_status(url)
+    if opts["local"] or not url:
+        return run_local(argv_strip(argv), "RSCAD_LOCAL set" if opts["local"] else "no server configured")
+
+    t0 = time.time()
+    files = bundle_files(root, opts["verbose"]) if n_inputs else []
+    rel_cwd = os.path.relpath(cwd, root)
+    rel_cwd = "" if rel_cwd == "." else rel_cwd
+    job = {"args": fwd, "cwd": rel_cwd, "timeout": float(opts["timeout"]) if opts["timeout"] else None,
+           "client": socket.gethostname()}
+
+    h = hashlib.sha256()
+    h.update(json.dumps({"args": fwd, "cwd": rel_cwd}, sort_keys=True).encode())
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=3) as tar:
+        jb = json.dumps(job).encode()
+        ti = tarfile.TarInfo("job.json"); ti.size = len(jb)
+        tar.addfile(ti, io.BytesIO(jb))
+        for rel, full in files:
+            with open(full, "rb") as f:
+                data = f.read()
+            h.update(rel.encode() + b"\0" + hashlib.sha256(data).digest())
+            ti = tarfile.TarInfo(os.path.join("src", rel)); ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+        for idx, full in enumerate(externs):
+            with open(full, "rb") as f:
+                data = f.read()
+            name = f"src/__extern__/{idx}/{os.path.basename(full)}"
+            h.update(name.encode() + b"\0" + hashlib.sha256(data).digest())
+            ti = tarfile.TarInfo(name); ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+    body = buf.getvalue()
+    if opts["verbose"]:
+        sys.stderr.write(f"rscad: root {root}, {len(files)} files + {len(externs)} extern, {len(body)//1024} KB -> {url}\n")
+
+    req = urllib.request.Request(url.rstrip("/") + "/api/render", data=body, method="POST", headers={
+        "Content-Type": "application/gzip", "X-Token": token, "X-Job-Key": h.hexdigest(),
+        "X-Client": socket.gethostname(), **({"X-Engine": opts["engine"]} if opts["engine"] else {})})
+    timeout = (float(opts["timeout"]) if opts["timeout"] else 1800.0) + 120
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = r.read()
+            cached = r.headers.get("X-Cached") == "1"
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e)["error"]
+        except Exception:  # noqa
+            msg = str(e)
+        if e.code == 401:
+            sys.stderr.write("rscad: server rejected the token (RSCAD_TOKEN / ~/.config/rscad/token)\n")
+            return 2
+        sys.stderr.write(f"rscad: server error {e.code}: {msg}\n")
+        return 2
+    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+        return run_local(argv_strip(argv), f"server {url} unreachable ({getattr(e, 'reason', e)})")
+
+    with tarfile.open(fileobj=io.BytesIO(resp), mode="r:gz") as tar:
+        result = json.load(tar.extractfile("result.json"))
+        for m in tar.getmembers():
+            if not m.isfile() or not m.name.startswith("out/"):
+                continue
+            parts = m.name.split("/", 2)
+            if len(parts) != 3 or not parts[1].isdigit() or int(parts[1]) >= len(outputs):
+                continue
+            dest = outputs[int(parts[1])]
+            data = tar.extractfile(m).read()
+            if dest.endswith(".d"):      # depfile: translate server paths back to this machine
+                text = data.decode(errors="replace")
+                for idx, o in enumerate(outputs):
+                    text = text.replace(f"{result['out_dir']}/{idx}/{os.path.basename(o)}", o)
+                text = text.replace(result["src_dir"] + "/", os.path.realpath(root) + "/")
+                data = text.encode()
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(data)
+    sys.stdout.write(result["stdout"]); sys.stdout.flush()
+    sys.stderr.write(result["stderr"]); sys.stderr.flush()
+    if opts["verbose"]:
+        sys.stderr.write(f"rscad: {result['engine']} rc={result['returncode']} render {result['seconds']}s "
+                         f"queue {result['queue_seconds']}s total {time.time()-t0:.1f}s{' (cached)' if cached else ''}\n")
+    return result["returncode"]
+
+
+def argv_strip(argv):
+    return [a for a in argv if not a.startswith("--rscad-")]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

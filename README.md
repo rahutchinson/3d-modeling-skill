@@ -19,6 +19,7 @@ What's in the box:
 | `references/test-first.md` | coupons and gauge sweeps before any long print |
 | `references/printer.md` | printer envelope, materials, and a **lab notebook of measured values** |
 | `tools/scadview/` | live viewer: orbit any part in a browser, sliders for params, re-renders on save |
+| `tools/scadserver/` | render server + `rscad`, a drop-in `openscad` that runs every render on another machine |
 | `template/` | a starter project that follows every convention above |
 | `inbox/` | drop zone for raw research, distilled into the references on demand |
 
@@ -53,7 +54,9 @@ references on demand.
 
 Requirements: [OpenSCAD](https://openscad.org) on `PATH` (2021.01 works;
 a 2023+ build with the Manifold backend renders much faster), Python 3.8+
-for the viewer (stdlib only), `make`.
+for the viewer (stdlib only), `make`. Or install OpenSCAD on one machine
+only and run `tools/scadserver/` there: `OPENSCAD=rscad make` on any other
+machine renders remotely (see [tools/scadserver/README.md](tools/scadserver/README.md)).
 
 ## Start a project
 

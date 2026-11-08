@@ -41,6 +41,8 @@ clearance number.**
 - `references/test-first.md` — the coupon/gauge methodology: never
   commit a multi-hour print to an unverified fit.
 - `tools/scadview/README.md` — the live viewer: config, deep links, API.
+- `tools/scadserver/README.md` — the render server: `OPENSCAD=rscad make`
+  sends every openscad call to another machine and writes the outputs back.
 - `template/` — a starter project (params.scad, Makefile, parts/, lib/,
   scadview.json) that already follows every convention above.
 
@@ -57,6 +59,18 @@ clearance number.**
    checks run with a positive control.
 5. After the user reports print results, record them in `printer.md`
    (measured section) — that's how this skill gets smarter.
+
+## Where renders run
+
+If `rscad` is on PATH (see `tools/scadserver/`), put every openscad call
+through it: `OPENSCAD=rscad make`, `OPENSCAD=rscad ./tools/check.sh`,
+`OPENSCAD=rscad make view`. It ships the project to the render server
+and writes the outputs back, so this machine never runs OpenSCAD. The
+server's default engine is a current nightly with the Manifold backend
+(renders that take CGAL 30+ s finish in well under a second). Pass
+`--rscad-engine=2021` (or `RSCAD_ENGINE=2021`) when the legacy CGAL
+summary is needed, e.g. the `Volumes:` count for a fused-parts check.
+If the server is down, rscad runs a local openscad and says so.
 
 ## Showing the user a part: viewer links, not renders
 

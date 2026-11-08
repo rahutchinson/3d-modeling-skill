@@ -60,12 +60,18 @@ params.scad-driven workflow.
   It changes old advice like "never minkowski" to "minkowski is
   affordable, though rarely optimal". [community, consensus]
   **Check `openscad --version` before assuming any of this.** The
-  author's machine ran 2021.01 (checked 2026-08-03), which predates
-  Manifold entirely — no `--backend` flag, and no 2023+ language
-  features. Upgrading to a current release/nightly is the single biggest
-  render-speed win available; until then, the legacy CGAL advice (avoid
-  minkowski, keep $fn modest) fully applies, and `assert()`/Customizer
-  syntax are the only "new" features safe to assume. [measured]
+  author's local install is 2021.01, which predates Manifold entirely —
+  no `--backend` flag, no 2023+ language features. Since 2026-11-07 the
+  render server (`tools/scadserver/`, `OPENSCAD=rscad`) runs a 2026.11
+  nightly with Manifold as its default engine: the cabinet-lock latch went
+  from 37 s (CGAL) to 0.2 s, a four-part build from 37 s to 0.5 s. [measured]
+  Two consequences: on a plain 2021.01 install the legacy CGAL advice
+  (avoid minkowski, keep $fn modest) still fully applies and only
+  `assert()`/Customizer syntax are safe to assume; and the Manifold
+  summary has **no `Volumes:` line** (it prints `Status`/`Genus`/
+  `Vertices`/`Facets`), so a fused-parts volume count needs
+  `--rscad-engine=2021`. `--summary all` adds the bounding box, handy
+  for locating an interference hit.
 - `render(convexity=n)` around a heavy subtree caches it as a mesh —
   duplicated/translated instances reuse the cache instead of
   re-evaluating the CSG.
@@ -150,4 +156,5 @@ Two related lessons:
   part (e.g. `latch_dx`) rather than change a design parameter.
 - **Check for fused parts.** A print-in-place STL with N parts must
   report `Volumes: N+1` from OpenSCAD's render. One fewer means two
-  parts are fused.
+  parts are fused. (CGAL summary only — on the render server use
+  `--rscad-engine=2021`; Manifold's summary has no volume count.)

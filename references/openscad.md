@@ -112,6 +112,10 @@ per-object overrides. [community, consensus]
   `-include $(wildcard stl/*.d)`. [community]
 - Named targets for every part, plus `test`, `coupon`, and `gauge`
   targets (see test-first.md).
+- `OPENSCAD ?= openscad` is the only place the Makefile names the
+  binary, and scripts use `${OPENSCAD:-openscad}`, so `OPENSCAD=rscad make`
+  moves the whole build to the render server (tools/scadserver) with no
+  other change. Never hardcode `openscad` in a recipe. [measured]
 - Print-critical warnings live as Makefile comments next to the target
   (e.g. "PRINT WITHOUT SUPPORT — residue in the 2 mm pocket reads as
   too tight"). [measured]
