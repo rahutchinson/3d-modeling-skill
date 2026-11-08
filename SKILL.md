@@ -43,6 +43,8 @@ clearance number.**
 - `tools/scadview/README.md` — the live viewer: config, deep links, API.
 - `tools/scadserver/README.md` — the render server: `OPENSCAD=rscad make`
   sends every openscad call to another machine and writes the outputs back.
+- `tools/printlog/README.md` — the shared print history: what has been
+  printed, failed, or never printed, across every project and machine.
 - `template/` — a starter project (params.scad, Makefile, parts/, lib/,
   scadview.json) that already follows every convention above.
 
@@ -58,7 +60,8 @@ clearance number.**
    render succeeds, asserts pass, and (for mating parts) interference
    checks run with a positive control.
 5. After the user reports print results, record them in `printer.md`
-   (measured section) — that's how this skill gets smarter.
+   (measured section) — that's how this skill gets smarter — **and** in
+   the print history with `printlog log` (see below).
 
 ## Where renders run
 
@@ -71,6 +74,30 @@ server's default engine is a current nightly with the Manifold backend
 `--rscad-engine=2021` (or `RSCAD_ENGINE=2021`) when the legacy CGAL
 summary is needed, e.g. the `Volumes:` count for a fused-parts check.
 If the server is down, rscad runs a local openscad and says so.
+
+## Print history
+
+If `printlog` is on PATH (see `tools/printlog/`), it is the shared record of
+what has actually been printed. It is one server, so every machine and
+session sees the same history.
+
+- **Before suggesting a print, or when picking up a project**, run
+  `printlog status` in it. That shows which parts were never printed,
+  which were printed but have changed since (`changed`), and which failed.
+  Don't tell the user to print something they already printed unless it
+  is `changed` or `failed`.
+- **When the user says they printed, started, or plan something**, log it
+  right away with the part names from `stl/`:
+  `printlog log <part>... --status printed|failed|printing|planned`.
+  Add `--verdict "<their words>"`, `--material`, `--notes`, and
+  `--date YYYY-MM-DD` if it wasn't today. For a gauge, log the variant
+  they kept as printed and add `--param` for the value. A result that
+  teaches something also goes in `printer.md`; the two complement each
+  other.
+- **"What have I printed?" / "what's left?"**: `printlog todo --all`,
+  `printlog list --all`, or the history page at the server's `/`.
+- Correct a wrong entry with `printlog edit <id>` instead of logging a
+  second one.
 
 ## Showing the user a part: viewer links, not renders
 

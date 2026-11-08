@@ -20,6 +20,7 @@ What's in the box:
 | `references/printer.md` | printer envelope, materials, and a **lab notebook of measured values** |
 | `tools/scadview/` | live viewer: orbit any part in a browser, sliders for params, re-renders on save |
 | `tools/scadserver/` | render server + `rscad`, a drop-in `openscad` that runs every render on another machine |
+| `tools/printlog/` | shared print history: what has been printed, failed, or never printed, from any machine |
 | `template/` | a starter project that follows every convention above |
 | `inbox/` | drop zone for raw research, distilled into the references on demand |
 

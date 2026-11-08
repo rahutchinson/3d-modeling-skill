@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""printlog — record and query what has been printed, against a printlog-server.
+
+    printlog status                       # this project: sync stl/ catalog, show every part's state
+    printlog todo                         # all projects: never printed / changed since / failed / planned
+    printlog log pinion latch_left        # record a successful print (one plate, several parts)
+    printlog log collar_g2 --status failed --verdict "too tight on the shaft" --material PETG
+    printlog log stand --status planned   # queue it up
+    printlog list [--all] [--part P]      # history, newest first
+    printlog edit 12 --status printed --verdict "fits"
+    printlog rm 12
+
+Run inside a project (any dir under one with params.scad, Makefile,
+scadview.json or stl/); the project name is that dir's name. A part is a
+file in stl/ by its base name (pinion -> stl/pinion.stl), or any path.
+The STL's sha256 is recorded with the print, so `status` can say when a
+part has changed since it was last printed.
+
+Config (env wins over file):
+  PRINTLOG_URL    ~/.config/printlog/url     e.g. http://render-box:8791
+  PRINTLOG_TOKEN  ~/.config/printlog/token   (falls back to ~/.config/rscad/token)
+
+If the server is unreachable, `log` saves the entry to
+~/.local/state/printlog/queue.jsonl and sends it on the next run.
+Add --json to status/todo/list/show for machine-readable output.
+"""
+import argparse, fnmatch, hashlib, json, os, socket, sys
+import urllib.error, urllib.request
+
+MARKERS = ("params.scad", "scadview.json", "Makefile", "stl")
+PART_EXT = (".stl", ".3mf")
+DEFAULT_IGNORE = ["*assembly*"]
+STATUSES = ("planned", "printing", "printed", "failed")
+QUEUE = os.path.expanduser("~/.local/state/printlog/queue.jsonl")
+STATE_ORDER = {"failed": 0, "changed": 1, "never": 2, "planned": 3, "printing": 3, "printed": 4}
+
+
+def cfg(env, fname):
+    v = os.environ.get(env)
+    if v:
+        return v.strip()
+    try:
+        with open(os.path.expanduser(f"~/.config/printlog/{fname}")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def base_url():
+    u = cfg("PRINTLOG_URL", "url")
+    if not u:
+        # same box as the render server, next port
+        try:
+            with open(os.path.expanduser("~/.config/rscad/url")) as f:
+                r = f.read().strip().rstrip("/")
+            host, _, port = r.rpartition(":")
+            u = f"{host}:{int(port) + 1}" if port.isdigit() else ""
+        except OSError:
+            pass
+    if not u:
+        sys.exit("printlog: no server configured (set PRINTLOG_URL or ~/.config/printlog/url)")
+    return u.rstrip("/")
+
+
+def token():
+    t = cfg("PRINTLOG_TOKEN", "token")
+    if not t:
+        try:
+            with open(os.path.expanduser("~/.config/rscad/token")) as f:
+                t = f.read().strip()
+        except OSError:
+            pass
+    return t
+
+
+class Unreachable(Exception):
+    pass
+
+
+def api(method, path, body=None, timeout=15):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base_url() + path, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Client", socket.gethostname())
+    tok = token()
+    if tok:
+        req.add_header("X-Token", tok)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error")
+        except Exception:  # noqa
+            msg = e.reason
+        sys.exit(f"printlog: server said {e.code}: {msg}")
+    except (urllib.error.URLError, OSError) as e:
+        raise Unreachable(str(getattr(e, "reason", e)))
+
+
+# ---------------------------------------------------------------- project
+def find_root(start):
+    d = os.path.abspath(start)
+    home = os.path.expanduser("~")
+    while True:
+        if any(os.path.exists(os.path.join(d, m)) for m in MARKERS):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d or d == home:
+            return None
+        d = parent
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ignore_patterns(root):
+    pats = list(DEFAULT_IGNORE)
+    try:
+        with open(os.path.join(root, ".printignore")) as f:
+            pats += [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        pass
+    return pats
+
+
+def catalog(root):
+    stl = os.path.join(root, "stl")
+    pats = ignore_patterns(root)
+    parts = []
+    if not os.path.isdir(stl):
+        return parts
+    for fn in sorted(os.listdir(stl)):
+        name, ext = os.path.splitext(fn)
+        if ext.lower() not in PART_EXT or any(fnmatch.fnmatch(fn, p) or fnmatch.fnmatch(name, p) for p in pats):
+            continue
+        full = os.path.join(stl, fn)
+        st = os.stat(full)
+        parts.append({"part": name, "path": os.path.relpath(full, root), "sha256": sha256(full),
+                      "size": st.st_size, "mtime": st.st_mtime})
+    return parts
+
+
+def project_of(a, need=True):
+    root = find_root(a.dir or os.getcwd())
+    proj = a.project or (os.path.basename(root) if root else None)
+    if need and not proj:
+        sys.exit("printlog: not inside a project; pass --project NAME (or -C DIR)")
+    return proj, root
+
+
+def sync(proj, root):
+    if not root or os.path.basename(root) != proj:
+        return None
+    return api("POST", "/api/parts", {"project": proj, "root": root, "parts": catalog(root)})
+
+
+def flush_queue(quiet=False):
+    try:
+        with open(QUEUE) as f:
+            pending = [json.loads(l) for l in f if l.strip()]
+    except OSError:
+        return
+    left = []
+    for i, rec in enumerate(pending):
+        try:
+            r = api("POST", "/api/prints", rec)
+            if not quiet:
+                print(f"sent queued #{r['id']} {rec['project']}/{rec['part']} {rec['status']}", file=sys.stderr)
+        except Unreachable:
+            left = pending[i:]
+            break
+    with open(QUEUE, "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in left)
+    if not left:
+        os.remove(QUEUE)
+
+
+# ---------------------------------------------------------------- output
+def table(rows, cols):
+    if not rows:
+        return
+    w = {c: max(len(c), *(len(str(r.get(c) if r.get(c) is not None else "")) for r in rows)) for c in cols}
+    print("  ".join(c.ljust(w[c]) for c in cols).rstrip())
+    for r in rows:
+        print("  ".join(str(r.get(c) if r.get(c) is not None else "").ljust(w[c]) for c in cols).rstrip())
+
+
+def show_parts(parts, with_project):
+    rows = []
+    for p in sorted(parts, key=lambda p: (p["project"], STATE_ORDER.get(p["state"], 9), p["part"])):
+        lat = p.get("latest") or {}
+        rows.append({"project": p["project"], "part": p["part"] + ("" if p["in_catalog"] else " (gone)"),
+                     "state": p["state"], "printed": p["times_printed"] or "",
+                     "last": p["last_printed_at"] or "", "note": lat.get("verdict") or p.get("last_verdict") or ""})
+    table(rows, (["project"] if with_project else []) + ["part", "state", "printed", "last", "note"])
+
+
+def show_prints(rows):
+    table([{"id": r["id"], "date": r.get("printed_at") or "", "project": r["project"], "part": r["part"],
+            "status": r["status"], "qty": r["qty"], "material": r.get("material") or "",
+            "verdict": (r.get("verdict") or "") + (f"  [{r['notes']}]" if r.get("notes") else "")} for r in rows],
+          ["id", "date", "project", "part", "status", "qty", "material", "verdict"])
+
+
+def emit(obj, as_json, fn):
+    if as_json:
+        print(json.dumps(obj, indent=1))
+    else:
+        fn(obj)
+
+
+# ---------------------------------------------------------------- commands
+def cmd_status(a):
+    proj, root = project_of(a)
+    flush_queue()
+    parts = sync(proj, root)
+    if parts is None:
+        parts = api("GET", f"/api/parts?project={proj}")
+    if a.state:
+        parts = [p for p in parts if p["state"] in a.state.split(",")]
+    def human(ps):
+        counts = {}
+        for p in ps:
+            counts[p["state"]] = counts.get(p["state"], 0) + 1
+        print(f"{proj}: " + (", ".join(f"{n} {s}" for s, n in sorted(counts.items(), key=lambda kv: STATE_ORDER.get(kv[0], 9))) or "no parts in stl/"))
+        show_parts(ps, False)
+    emit(parts, a.json, human)
+
+
+def cmd_sync(a):
+    proj, root = project_of(a)
+    flush_queue()
+    r = sync(proj, root)
+    if r is None:
+        sys.exit(f"printlog: {proj} has no project dir here to scan")
+    print(f"{proj}: {sum(1 for p in r if p['in_catalog'])} parts synced")
+
+
+def cmd_todo(a):
+    flush_queue()
+    proj, root = project_of(a, need=False)
+    if root and proj and not a.all:
+        sync(proj, root)
+    qs = "?state=" + (a.state or "never,changed,failed,planned,printing")
+    if a.project or (proj and not a.all and root):
+        qs += f"&project={proj}"
+    parts = [p for p in api("GET", "/api/parts" + qs) if p["in_catalog"] or p["state"] in ("planned", "printing")]
+    emit(parts, a.json, lambda ps: show_parts(ps, True) if ps else print("nothing outstanding"))
+
+
+def resolve_part(spec, root):
+    """-> (part name, file path or None)."""
+    if os.path.isfile(spec):
+        return os.path.splitext(os.path.basename(spec))[0], spec
+    if root:
+        for ext in PART_EXT:
+            p = os.path.join(root, "stl", spec + ext)
+            if os.path.isfile(p):
+                return spec, p
+    return spec, None
+
+
+def cmd_log(a):
+    proj, root = project_of(a)
+    try:
+        flush_queue()
+        if not a.no_sync:
+            sync(proj, root)
+        online = True
+    except Unreachable:
+        online = False
+    params = dict(kv.split("=", 1) for kv in (a.param or []))
+    for spec in a.parts:
+        name, path = resolve_part(spec, root)
+        rec = {"project": proj, "part": name, "status": a.status, "qty": a.qty}
+        if path:
+            rec["file"] = os.path.relpath(path, root) if root else path
+            rec["sha256"] = sha256(path)
+        elif a.status != "planned":
+            print(f"printlog: note: no file for {name!r} in {proj}/stl; logging without a hash", file=sys.stderr)
+        for k in ("material", "printer", "hours", "verdict", "notes"):
+            if getattr(a, k) not in (None, ""):
+                rec[k] = getattr(a, k)
+        if a.date:
+            rec["printed_at"] = a.date
+        if params:
+            rec["params"] = params
+        try:
+            if not online:
+                raise Unreachable("offline")
+            r = api("POST", "/api/prints", rec)
+            print(f"#{r['id']} {proj}/{name} {r['status']}" + (f" ({r['printed_at']})" if r.get("printed_at") else ""))
+        except Unreachable as e:
+            online = False
+            os.makedirs(os.path.dirname(QUEUE), exist_ok=True)
+            with open(QUEUE, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            print(f"printlog: server unreachable ({e}); queued {proj}/{name} in {QUEUE}", file=sys.stderr)
+
+
+def cmd_list(a):
+    flush_queue()
+    proj, root = project_of(a, need=False)
+    qs = [f"limit={a.limit}"]
+    if a.project or (proj and root and not a.all):
+        qs.append(f"project={proj}")
+    if a.part:
+        qs.append(f"part={a.part}")
+    if a.status:
+        qs.append(f"status={a.status}")
+    rows = api("GET", "/api/prints?" + "&".join(qs))
+    emit(rows, a.json, lambda rs: show_prints(rs) if rs else print("no prints logged"))
+
+
+def cmd_show(a):
+    emit(api("GET", f"/api/prints/{a.id}"), a.json or True, None)
+
+
+def cmd_edit(a):
+    rec = {k: getattr(a, k) for k in ("status", "qty", "material", "printer", "hours", "verdict", "notes")
+           if getattr(a, k) is not None}
+    if a.date:
+        rec["printed_at"] = a.date
+    if a.part:
+        rec["part"] = a.part
+    r = api("PATCH", f"/api/prints/{a.id}", rec)
+    show_prints([r])
+
+
+def cmd_rm(a):
+    r = api("DELETE", f"/api/prints/{a.id}")
+    print(f"deleted #{r['id']} {r['project']}/{r['part']} {r['status']}")
+
+
+def cmd_server(a):
+    s = api("GET", "/api/status")
+    if a.json:
+        return print(json.dumps(s, indent=1))
+    print(f"{base_url()}  prints: " + (", ".join(f"{n} {k}" for k, n in s["prints"].items()) or "none") +
+          "  catalog: " + (", ".join(f"{n} {k}" for k, n in s["catalog_states"].items()) or "empty"))
+    for p in s["projects"]:
+        print(f"  {p['project']}  ({p['client']}:{p['root']})")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="printlog", description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n", 2)[2])
+    ap.add_argument("-C", dest="dir", help="act as if run in DIR")
+    ap.add_argument("--project", help="project name (default: the enclosing project dir's name)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p, js=True):
+        p.add_argument("-C", dest="dir", default=argparse.SUPPRESS)
+        p.add_argument("--project", default=argparse.SUPPRESS)
+        if js:
+            p.add_argument("--json", action="store_true")
+        return p
+
+    p = common(sub.add_parser("status", help="sync this project's catalog and show each part's state"))
+    p.add_argument("--state", help="only these states, comma separated")
+    p.set_defaults(fn=cmd_status)
+    common(sub.add_parser("sync", help="send this project's stl/ catalog to the server"), js=False).set_defaults(fn=cmd_sync)
+    p = common(sub.add_parser("todo", help="parts never printed, changed since printed, failed, or planned"))
+    p.add_argument("--all", action="store_true", help="every project, even inside one")
+    p.add_argument("--state", help="override the states listed")
+    p.set_defaults(fn=cmd_todo)
+
+    def fields(p, edit=False):
+        p.add_argument("--status", choices=STATUSES, default=None if edit else "printed")
+        p.add_argument("--qty", type=int, default=None if edit else 1)
+        p.add_argument("--material")
+        p.add_argument("--printer")
+        p.add_argument("--hours", type=float)
+        p.add_argument("--verdict", help="how it came out, in the user's words")
+        p.add_argument("--notes")
+        p.add_argument("--date", help="YYYY-MM-DD it came off the bed (default today for printed/failed)")
+
+    p = common(sub.add_parser("log", help="record a print of one or more parts"), js=False)
+    p.add_argument("parts", nargs="+", help="part names (stl/<name>.stl) or file paths")
+    fields(p)
+    p.add_argument("--param", action="append", metavar="K=V", help="params the print was made with (repeatable)")
+    p.add_argument("--no-sync", action="store_true")
+    p.set_defaults(fn=cmd_log)
+
+    p = common(sub.add_parser("list", help="print history, newest first"))
+    p.add_argument("--all", action="store_true", help="every project, even inside one")
+    p.add_argument("--part")
+    p.add_argument("--status", choices=STATUSES)
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(fn=cmd_list)
+
+    p = common(sub.add_parser("show", help="one print as JSON"))
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_show)
+    p = common(sub.add_parser("edit", help="change fields of a print"), js=False)
+    p.add_argument("id", type=int)
+    p.add_argument("--part")
+    fields(p, edit=True)
+    p.set_defaults(fn=cmd_edit)
+    p = common(sub.add_parser("rm", help="delete a print"), js=False)
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_rm)
+    p = sub.add_parser("server", help="server status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_server)
+
+    a = ap.parse_args()
+    for k in ("dir", "project"):
+        if not hasattr(a, k):
+            setattr(a, k, None)
+    try:
+        a.fn(a)
+    except Unreachable as e:
+        sys.exit(f"printlog: server {base_url()} unreachable: {e}")
+
+
+if __name__ == "__main__":
+    main()
