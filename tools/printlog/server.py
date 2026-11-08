@@ -336,6 +336,9 @@ def on_printer(snap):
                 return
         if rec["status"] != "printing" and rec.get("ended_at"):
             return          # already closed (or the user changed it): leave it alone
+        if rec["status"] == "printing" and snap.get("material") and snap["material"] != rec.get("material"):
+            # Bambu reports the spool piecemeal; the first reading at job start can be a default
+            rec = update_print(rec["id"], {"material": snap["material"]})
         if st in ("finished", "failed") and rec["status"] in ("printing", "printed", "failed"):
             started = rec.get("started_at") or snap.get("started_at")
             hours = round((now - started) / 3600, 2) if started else None
