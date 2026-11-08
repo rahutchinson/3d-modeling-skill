@@ -9,6 +9,11 @@
     printlog list [--all] [--part P]      # history, newest first
     printlog edit 12 --status printed --verdict "fits"
     printlog rm 12
+    printlog printers                     # live state of the watched printers
+
+Prints started on a watched printer are logged automatically (see the
+server README); fix a wrong auto-match with
+`printlog edit ID --set-project P --part X`.
 
 Run inside a project (any dir under one with params.scad, Makefile,
 scadview.json or stl/); the project name is that dir's name. A part is a
@@ -204,8 +209,9 @@ def show_parts(parts, with_project):
 def show_prints(rows):
     table([{"id": r["id"], "date": r.get("printed_at") or "", "project": r["project"], "part": r["part"],
             "status": r["status"], "qty": r["qty"], "material": r.get("material") or "",
+            "printer": r.get("printer") or "", "hours": r.get("hours") or "",
             "verdict": (r.get("verdict") or "") + (f"  [{r['notes']}]" if r.get("notes") else "")} for r in rows],
-          ["id", "date", "project", "part", "status", "qty", "material", "verdict"])
+          ["id", "date", "project", "part", "status", "qty", "material", "printer", "hours", "verdict"])
 
 
 def emit(obj, as_json, fn):
@@ -329,13 +335,42 @@ def cmd_edit(a):
         rec["printed_at"] = a.date
     if a.part:
         rec["part"] = a.part
+    if a.set_project:
+        rec["project"] = a.set_project
     r = api("PATCH", f"/api/prints/{a.id}", rec)
     show_prints([r])
+
 
 
 def cmd_rm(a):
     r = api("DELETE", f"/api/prints/{a.id}")
     print(f"deleted #{r['id']} {r['project']}/{r['part']} {r['status']}")
+
+
+def fmt_secs(v):
+    if not v:
+        return ""
+    v = int(v)
+    return f"{v // 3600}h{(v % 3600) // 60:02d}m"
+
+
+def cmd_printers(a):
+    ps = api("GET", "/api/printers")
+    def human(ps):
+        if not ps:
+            return print("no printers configured on the server (~/.config/printlog/printers.json)")
+        rows = []
+        for p in ps:
+            pr = p.get("print") or {}
+            active = p["state"] in ("printing", "paused")
+            rows.append({"printer": p["name"], "model": p.get("model") or p["type"], "state": p["state"],
+                         "job": (p.get("file") or "") if p["state"] not in ("idle", "offline") else "",
+                         "part": f"#{pr['id']} {pr['project']}/{pr['part']}" if pr else "",
+                         "progress": f"{p.get('progress') or 0}%" if active else "",
+                         "left": fmt_secs(p.get("remaining_s")) if active else "",
+                         "material": p.get("material") or ""})
+        table(rows, ["printer", "model", "state", "job", "part", "progress", "left", "material"])
+    emit(ps, a.json, human)
 
 
 def cmd_server(a):
@@ -401,11 +436,15 @@ def main():
     p = common(sub.add_parser("edit", help="change fields of a print"), js=False)
     p.add_argument("id", type=int)
     p.add_argument("--part")
+    p.add_argument("--set-project", help="move the entry to another project")
     fields(p, edit=True)
     p.set_defaults(fn=cmd_edit)
     p = common(sub.add_parser("rm", help="delete a print"), js=False)
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_rm)
+    p = sub.add_parser("printers", help="live state of the printers the server watches")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_printers)
     p = sub.add_parser("server", help="server status")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_server)

@@ -9,6 +9,13 @@ what hasn't?". Clients use the `printlog` CLI served at /printlog.
 Stdlib only. Config: ~/.config/printlog/config.json (see DEFAULTS).
 Data: ~/.local/share/printlog/prints.db.
 
+Printers: list them in ~/.config/printlog/printers.json (see printers.py
+and README) and the server watches them. A job that starts is logged as
+`printing` against the project part its file name matches. When it ends,
+the entry becomes `printed` (with hours) or `failed` (with where it
+stopped). Jobs are keyed by the printer's job id, so restarts don't
+duplicate them.
+
 Auth: writes need the token in ~/.config/printlog/token (on first start it
 reuses ~/.config/openscad-server/token if that exists, so one secret
 covers both services; otherwise one is generated). Reads are open, like
@@ -21,19 +28,24 @@ API (JSON):
   DELETE /api/prints/<id>                                                            (token)
   GET    /api/parts?project=&state=                  catalog + derived print state
   POST   /api/parts                                  {project, root, parts:[...]}    (token)
+  GET    /api/printers                               live printer state
   GET    /api/status                                 counts
 """
-import argparse, html, json, os, secrets, sqlite3, threading, time
+import argparse, html, json, os, re, secrets, sqlite3, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import printers as printer_mod  # noqa: E402
 DEFAULTS = {"bind": "0.0.0.0", "port": 8791, "db": "~/.local/share/printlog/prints.db"}
 STATUSES = ("planned", "printing", "printed", "failed")
 FIELDS = ("project", "part", "status", "file", "sha256", "qty", "material", "printer", "hours",
-          "verdict", "notes", "params", "printed_at", "client")
+          "verdict", "notes", "params", "printed_at", "client", "job", "started_at", "ended_at")
 
-CFG, TOKEN, DB, LOCK = {}, "", None, threading.Lock()
+CFG, TOKEN, DB, LOCK = {}, "", None, threading.RLock()
+MONITORS = []
+JOB_LOCK = threading.Lock()
 STARTED = time.time()
 
 SCHEMA = """
@@ -58,6 +70,17 @@ CREATE TABLE IF NOT EXISTS parts(
 CREATE TABLE IF NOT EXISTS projects(
   project TEXT PRIMARY KEY, root TEXT, client TEXT, synced_at REAL);
 """
+MIGRATIONS = {"prints": {"job": "TEXT", "started_at": "REAL", "ended_at": "REAL"}}
+
+
+def migrate(db):
+    for table, cols in MIGRATIONS.items():
+        have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        for col, typ in cols.items():
+            if col not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    db.execute("CREATE INDEX IF NOT EXISTS prints_job ON prints(printer, job)")
+    db.commit()
 
 
 def log(*a):
@@ -245,6 +268,119 @@ def part_states(project=None, state=None, include_gone=False):
     return out
 
 
+# ---------------------------------------------------------------- printers
+def strip_job_name(name):
+    base = os.path.basename(name or "")
+    for _ in range(3):
+        root, ext = os.path.splitext(base)
+        if ext.lower() in (".gcode", ".3mf", ".bgcode", ".g", ".gco"):
+            base = root
+    return base
+
+
+def match_job(file):
+    """File name on the printer -> (project, part, sha, note).
+
+    A part matches when the job name is the part name, or starts with it
+    and continues with a separator (slicers append _PETG_52m47s, _plate_1
+    ...). The longest matching name wins. If several projects have it, the
+    most recently rendered STL wins and the note names the rest."""
+    name = strip_job_name(file)
+    low = name.lower()
+    best, best_len = [], 0
+    for r in q("SELECT * FROM parts WHERE present=1"):
+        part = r["part"].lower()
+        if low == part or (low.startswith(part) and low[len(part)] in "_- .("):
+            if len(part) > best_len:
+                best, best_len = [r], len(part)
+            elif len(part) == best_len:
+                best.append(r)
+    if not best:
+        projects = {r["project"].lower(): r["project"] for r in q("SELECT project FROM projects")}
+        for proj_low, proj in projects.items():
+            if low == proj_low or (low.startswith(proj_low) and low[len(proj_low)] in "_- .("):
+                return proj, name, None, f"auto: job {file!r} named after the project, not a part"
+        return "unmatched", name, None, f"auto: job {file!r} matched no part; fix with printlog edit"
+    best.sort(key=lambda r: r.get("mtime") or 0, reverse=True)
+    top = best[0]
+    note = f"auto: {file}"
+    if len(best) > 1:
+        note += "; also matches " + ", ".join(f"{r['project']}/{r['part']}" for r in best[1:])
+    return top["project"], top["part"], top.get("sha256"), note
+
+
+def on_printer(snap):
+    st, job, name = snap.get("state"), snap.get("job"), snap["name"]
+    if not job or st not in ("printing", "paused", "finished", "failed"):
+        return
+    with JOB_LOCK:
+        rec = q("SELECT * FROM prints WHERE printer=? AND job=? ORDER BY id DESC LIMIT 1", (name, job), one=True)
+        now = time.time()
+        if rec is None:
+            if st in ("printing", "paused"):
+                # a new job supersedes any auto entry this printer left at 'printing'
+                for old in q("SELECT * FROM prints WHERE printer=? AND status='printing' AND job IS NOT NULL", (name,)):
+                    update_print(old["id"], {"status": "failed", "notes": (old.get("notes") or "") +
+                                             "; printer started another job before this one reported an end — check"})
+            project, part, sha, note = match_job(snap.get("file"))
+            rec = add_print({"project": project, "part": part, "printer": name, "job": job, "sha256": sha,
+                             "file": snap.get("file"), "material": snap.get("material"), "notes": note,
+                             "started_at": snap.get("started_at") or now, "client": f"printer:{name}",
+                             **({"hours": round(snap["elapsed_s"] / 3600, 2)} if st != "printing" and snap.get("elapsed_s") else {}),
+                             "status": "printing" if st in ("printing", "paused") else
+                                       ("printed" if st == "finished" else "failed"),
+                             **({} if st in ("printing", "paused") else {"ended_at": now})})
+            if st in ("printing", "paused"):
+                return
+            if st == "finished" and not snap.get("started_at"):
+                return
+        if rec["status"] != "printing" and rec.get("ended_at"):
+            return          # already closed (or the user changed it): leave it alone
+        if st in ("finished", "failed") and rec["status"] in ("printing", "printed", "failed"):
+            started = rec.get("started_at") or snap.get("started_at")
+            hours = round((now - started) / 3600, 2) if started else None
+            if snap.get("elapsed_s"):
+                hours = round(snap["elapsed_s"] / 3600, 2)
+            upd = {"status": "printed" if st == "finished" else "failed", "ended_at": now,
+                   "printed_at": time.strftime("%Y-%m-%d", time.localtime(now))}
+            if hours is not None and rec.get("hours") is None:
+                upd["hours"] = hours
+            if st == "failed":
+                where = f"stopped at {snap.get('progress')}%"
+                if snap.get("layer") is not None:
+                    where += f", layer {snap.get('layer')}/{snap.get('total_layers')}"
+                if snap.get("error"):
+                    where += f", error {snap.get('error')}"
+                upd["notes"] = (rec.get("notes") or "") + "; " + where
+            if rec["status"] == "printing":
+                log(f"printer {name}: {rec['project']}/{rec['part']} -> {upd['status']}")
+                update_print(rec["id"], upd)
+
+
+def printers_json():
+    out = []
+    for m in MONITORS:
+        s = m.snapshot()
+        if s.get("job"):
+            r = q("SELECT id, project, part, status FROM prints WHERE printer=? AND job=? ORDER BY id DESC LIMIT 1",
+                  (s["name"], s["job"]), one=True)
+            s["print"] = r
+        out.append(s)
+    return out
+
+
+def load_printers(cfg_dir):
+    path = os.path.join(cfg_dir, "printers.json")
+    try:
+        with open(path) as f:
+            confs = json.load(f)
+    except FileNotFoundError:
+        return []
+    if os.stat(path).st_mode & 0o077:
+        os.chmod(path, 0o600)       # holds LAN access codes
+    return confs
+
+
 def status_json():
     states = {}
     for p in part_states():
@@ -254,6 +390,7 @@ def status_json():
     return {"uptime_seconds": round(time.time() - STARTED), "db": CFG["db"],
             "prints": {r["status"]: r["n"] for r in tot},
             "catalog_states": states,
+            "printers": {m.conf["name"]: m.snapshot().get("state") for m in MONITORS},
             "projects": q("SELECT * FROM projects ORDER BY project")}
 
 
@@ -272,6 +409,7 @@ th{color:var(--mut);font-weight:600}code,pre{font:12px/1.4 ui-monospace,monospac
 .wrap{overflow-x:auto}
 </style>
 <h1>Print history</h1><small>%(host)s · %(summary)s</small>
+%(printers)s
 %(projects)s
 <h2>Recent prints</h2><div class=wrap><table><tr><th>#</th><th>date</th><th>project / part</th><th>status</th><th>qty</th><th>material</th><th>verdict / notes</th></tr>%(recent)s</table></div>
 <h2>Use it</h2><pre>curl -sf %(base)s/install.sh | sh -s -- TOKEN   # installs ~/.local/bin/printlog (TOKEN: ~/.config/printlog/token here)
@@ -284,6 +422,41 @@ printlog list --project cabinet-lock</pre>
 
 def esc(v):
     return html.escape("" if v is None else str(v))
+
+
+def fmt_secs(s):
+    if s in (None, ""):
+        return ""
+    s = int(s)
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def render_printers():
+    ps = printers_json()
+    if not ps:
+        return ""
+    cls = {"printing": "plan", "paused": "warn", "finished": "ok", "failed": "bad", "offline": "never", "idle": "never"}
+    rows = []
+    for p in ps:
+        job = ""
+        if p.get("file") and p["state"] not in ("idle", "offline"):
+            pr = p.get("print") or {}
+            job = esc(p["file"]) + (f"<br><small>#{pr['id']} {esc(pr['project'])}/{esc(pr['part'])}</small>" if pr else "")
+        prog = ""
+        if p["state"] in ("printing", "paused"):
+            prog = f"{p.get('progress') or 0}%"
+            if p.get("layer") is not None:
+                prog += f" · layer {p['layer']}/{p.get('total_layers')}"
+            if p.get("remaining_s"):
+                prog += f" · {fmt_secs(p['remaining_s'])} left"
+        temps = ""
+        if p.get("online") and p.get("nozzle") is not None:
+            temps = f"{float(p['nozzle']):.0f}° / {float(p['bed'] or 0):.0f}°"
+        rows.append(f"<tr><td><b>{esc(p['name'])}</b><br><small>{esc(p.get('model') or p['type'])} · {esc(p.get('host'))}</small></td>"
+                    f"<td class='st {cls.get(p['state'], '')}'>{esc(p['state'])}</td><td>{job}</td><td>{esc(prog)}</td>"
+                    f"<td>{esc(p.get('material') or '')}</td><td>{esc(temps)}</td></tr>")
+    return ("<h2>Printers</h2><div class=wrap><table><tr><th>printer</th><th>state</th><th>job</th><th>progress</th>"
+            "<th>material</th><th>nozzle / bed</th></tr>" + "".join(rows) + "</table></div>")
 
 
 def render_page(host):
@@ -310,12 +483,13 @@ def render_page(host):
     rec = "".join(
         f"<tr><td>{r['id']}</td><td>{esc(r['printed_at'] or '')}</td><td><code>{esc(r['project'])}/{esc(r['part'])}</code></td>"
         f"<td class='st {STATE_CLASS.get(r['status'], '')}'>{esc(r['status'])}</td><td>{r['qty']}</td><td>{esc(r['material'] or '')}</td>"
-        f"<td>{esc(r['verdict'] or '')}{'<br><small>' + esc(r['notes']) + '</small>' if r['notes'] else ''}</td></tr>"
+        f"<td>{esc(r['verdict'] or '')}{'<br><small>' + esc(r['notes']) + '</small>' if r['notes'] else ''}"
+        f"{'<br><small>' + esc(r['printer']) + (' · ' + str(r['hours']) + ' h' if r['hours'] else '') + '</small>' if r['printer'] else ''}</td></tr>"
         for r in recent) or "<tr><td colspan=7><small>nothing logged yet</small></td></tr>"
     s = status_json()
     summary = ", ".join(f"{n} {k}" for k, n in s["prints"].items()) or "no prints logged"
     summary += f" · {len(s['projects'])} projects synced"
-    return PAGE % {"host": esc(os.uname().nodename), "summary": esc(summary),
+    return PAGE % {"host": esc(os.uname().nodename), "summary": esc(summary), "printers": render_printers(),
                    "projects": "".join(blocks) or "<p class=mut>No projects synced yet — run <code>printlog status</code> in one.</p>",
                    "recent": rec, "base": esc(f"http://{host}")}
 
@@ -359,6 +533,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, render_page(host), "text/html; charset=utf-8")
         if path == "/api/status":
             return self._send(200, status_json())
+        if path == "/api/printers":
+            return self._send(200, printers_json())
         if path == "/api/prints":
             return self._send(200, list_prints(qs.get("project"), qs.get("part"), qs.get("status"), qs.get("limit", 200)))
         if path.startswith("/api/prints/"):
@@ -441,6 +617,8 @@ def main():
     DB.row_factory = sqlite3.Row
     DB.executescript(SCHEMA)
     DB.execute("PRAGMA journal_mode=WAL")
+    migrate(DB)
+    MONITORS.extend(printer_mod.start_all(load_printers(os.path.dirname(a.config)), on_printer, log))
     srv = ThreadingHTTPServer((CFG["bind"], CFG["port"]), Handler)
     srv.daemon_threads = True
     log(f"printlog on http://{os.uname().nodename}:{CFG['port']}  db={CFG['db']}")

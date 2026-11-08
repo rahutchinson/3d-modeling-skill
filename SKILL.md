@@ -86,8 +86,16 @@ session sees the same history.
   which were printed but have changed since (`changed`), and which failed.
   Don't tell the user to print something they already printed unless it
   is `changed` or `failed`.
-- **When the user says they printed, started, or plan something**, log it
-  right away with the part names from `stl/`:
+- **Prints run on a watched printer (the K1 SE, the A1 mini) log
+  themselves.** A start is logged as `printing`, and the end becomes
+  `printed` or `failed`. So when the user reports a result, look for that
+  entry first (`printlog list`, or `printlog printers` for what's running)
+  and add their verdict with `printlog edit <id> --verdict "..."` instead
+  of logging a second one. If an auto entry landed under `unmatched` or
+  the wrong part, move it with `--set-project/--part`. Name sliced files
+  after the part (`<part>.3mf`, `<part>_PETG.gcode`) so the match works.
+- **For anything the printers didn't see** (a print from elsewhere, a plan,
+  an old print), log it with the part names from `stl/`:
   `printlog log <part>... --status printed|failed|printing|planned`.
   Add `--verdict "<their words>"`, `--material`, `--notes`, and
   `--date YYYY-MM-DD` if it wasn't today. For a gauge, log the variant
