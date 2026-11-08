@@ -346,7 +346,7 @@ def on_printer(snap):
             if hours is not None and rec.get("hours") is None:
                 upd["hours"] = hours
             if st == "failed":
-                where = f"stopped at {snap.get('progress')}%"
+                where = f"{'cancelled' if snap.get('ended') == 'cancelled' else 'stopped'} at {snap.get('progress')}%"
                 if snap.get("layer") is not None:
                     where += f", layer {snap.get('layer')}/{snap.get('total_layers')}"
                 if snap.get("error"):

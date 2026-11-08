@@ -8,6 +8,8 @@ the printer reports to a common snapshot:
      "material", "nozzle", "bed", "error", "updated"}
 
 state is one of: offline, idle, printing, paused, finished, failed.
+When state is failed, "ended" says why: "cancelled" (someone stopped it)
+or "error".
 Each change goes to `on_update(snapshot)`, and the server turns job
 transitions into print records.
 
@@ -73,6 +75,7 @@ class Creality(Monitor):
     """Stock Creality OS (K1 family) status websocket on port 9999."""
     type = "creality"
     STATES = {0: "idle", 1: "printing", 2: "finished", 3: "failed", 4: "failed", 5: "paused"}
+    ENDED = {3: "error", 4: "cancelled"}
 
     def session(self):
         host, port = self.conf["host"], int(self.conf.get("port", 9999))
@@ -128,7 +131,8 @@ class Creality(Monitor):
             except (KeyError, TypeError, ValueError):
                 return None
         start = num("printStartTime")
-        return {"online": True, "state": st, "model": r.get("model") or self.conf.get("model"),
+        return {"online": True, "state": st, "ended": self.ENDED.get(r.get("state")),
+                "model": r.get("model") or self.conf.get("model"),
                 "file": base or None, "job": r.get("printId") or (f"{base}@{int(start)}" if base and start else None),
                 "progress": r.get("printProgress"), "layer": r.get("layer"), "total_layers": r.get("TotalLayer"),
                 "elapsed_s": r.get("printJobTime"), "remaining_s": r.get("printLeftTime"),
@@ -191,6 +195,7 @@ class Bambu(Monitor):
     type = "bambu"
     STATES = {"IDLE": "idle", "PREPARE": "printing", "SLICING": "printing", "RUNNING": "printing",
               "PAUSE": "paused", "FINISH": "finished", "FAILED": "failed"}
+    CANCEL_CODES = {"50348044", "0300400C"}      # HMS 0300_400C: "the task was canceled"
 
     def session(self):
         host, serial, code = self.conf["host"], self.conf["serial"], self.conf["access_code"]
@@ -273,7 +278,10 @@ class Bambu(Monitor):
         except (KeyError, TypeError, ValueError):
             pass
         err = p.get("print_error") or None
-        return {"online": True, "state": st, "model": self.conf.get("model"), "file": name,
+        ended = None
+        if st == "failed":
+            ended = "cancelled" if str(err) in self.CANCEL_CODES else "error"
+        return {"online": True, "state": st, "ended": ended, "model": self.conf.get("model"), "file": name,
                 "job": f"{job}:{name}" if job else (f"{name}@{int(start)}" if name and start else None),
                 "progress": p.get("mc_percent"), "layer": p.get("layer_num"), "total_layers": p.get("total_layer_num"),
                 "elapsed_s": (time.time() - start) if (start and st in ("printing", "paused")) else None,
